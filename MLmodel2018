@@ -1,0 +1,845 @@
+"""
+RadioML Modulation Classifier — v7 (RML2018.01a Edition)
+==========================================================
+Same architecture as v7 (2016 edition) — SNR-adaptive cross-attention
+fusion + HOC branch — adapted for RML2018.01a.
+
+OOM FIX (v7_2018 r2)
+──────────────────────
+  Original error: OOM allocating [64,4,1024,1024] attention matrix.
+  CrossStreamAttention over 1024 timesteps = 1024×1024 = 1M entries per
+  head per sample. At batch=64, 4 heads, float32 = ~1GB per attention layer.
+
+  Fix: Move sequence compression BEFORE cross-attention.
+  CrossAttn now operates on 128 timesteps → 128×128 = 16K entries.
+  That's 64x less memory — fits comfortably on GPU.
+
+  New architecture flow:
+    Input (B, 1024, 2)
+    → CV/Real ResBlocks ×3           (B, 1024, C)
+    → StridedConv(stride=8)          (B, 128,  C)   ← compress FIRST
+    → CrossStreamAttention ×3        (B, 128,  C)   ← then cross-attn
+    → SNR-Adaptive Gate              (B, 128, 160)
+    → BiLSTM(128)                    (B, 128, 256)
+    → ChannelAttention + GAP         (B, 256)
+    → HOC MLP                        (B, 64)
+    → Concat + Dense → softmax       (B, 24)
+
+KEY DIFFERENCES FROM 2016 EDITION
+───────────────────────────────────
+  Dataset:   HDF5 format, arrays X/Y/Z
+  Classes:   24 (not 11)
+  Seq len:   1024 IQ samples (not 128)
+  SNR range: -20 to +30 dB in 2dB steps (26 levels)
+  Samples:   4096 per (class, SNR)
+
+SOTA REFERENCE (RML2018.01a)
+──────────────────────────────
+  MoE-AMC (2023)                        : 71.76% all-SNR average
+  Multiscale + HOC (ScienceDirect 2023) : 94.39% high-SNR avg
+  Our target                            : >70% all-SNR, >93% high-SNR
+"""
+
+import os, json, time
+import numpy as np
+import h5py
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, f1_score
+from sklearn.utils.class_weight import compute_class_weight
+from collections import Counter
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+np.random.seed(42)
+tf.random.set_seed(42)
+
+strategy = tf.distribute.MirroredStrategy()
+print(f"GPUs available: {strategy.num_replicas_in_sync}")
+
+print("=" * 80)
+print("RadioML v7 — RML2018.01a  |  24 classes  |  1024 IQ samples")
+print("OOM fix: compress 1024→128 BEFORE cross-attention")
+print("=" * 80)
+start_time = time.time()
+
+RESULTS_DIR = '/kaggle/working/results_2018'
+MODEL_PATH  = f'{RESULTS_DIR}/modulation_classifier_v7_2018.keras'
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# ── Dataset path ───────────────────────────────────────────────────────────────
+for _p in [
+    '/kaggle/input/deepsig-dataset-radioml-2018/GOLD_XYZ_OSC.0001_1024.hdf5',
+    '/kaggle/input/radioml201801a/GOLD_XYZ_OSC.0001_1024.hdf5',
+    '/kaggle/input/rml2018/GOLD_XYZ_OSC.0001_1024.hdf5',
+]:
+    if os.path.exists(_p):
+        DATASET_PATH = _p
+        break
+else:
+    import subprocess
+    _f = subprocess.run(
+        ['find', '/kaggle/input', '-name', 'GOLD_XYZ_OSC.0001_1024.hdf5'],
+        capture_output=True, text=True).stdout.strip()
+    assert _f, "RML2018.01a HDF5 not found."
+    DATASET_PATH = _f.split('\n')[0]
+print(f"Dataset: {DATASET_PATH}")
+
+MODULATIONS_2018 = [
+    'OOK', '4ASK', '8ASK', 'BPSK', 'QPSK', '8PSK', '16PSK', '32PSK',
+    '16APSK', '32APSK', '64APSK', '128APSK', '16QAM', '32QAM', '64QAM',
+    '128QAM', '256QAM', 'AM-SSB-WC', 'AM-SSB-SC', 'AM-DSB-WC',
+    'AM-DSB-SC', 'FM', 'GMSK', 'OQPSK'
+]
+N_CLASSES        = len(MODULATIONS_2018)
+SEQ_LEN          = 1024
+SNR_LEVELS       = list(range(-20, 32, 2))   # 26 levels
+SNR_MIN_2018     = -20
+SNR_MAX_2018     = 30
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CUSTOM METRIC
+# ══════════════════════════════════════════════════════════════════════════════
+@tf.keras.utils.register_keras_serializable()
+class SoftArgmaxAccuracy(tf.keras.metrics.Metric):
+    def __init__(self, name='accuracy', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.total   = self.add_weight(name='total',   initializer='zeros')
+        self.correct = self.add_weight(name='correct', initializer='zeros')
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_pred_cls = tf.cast(tf.argmax(y_pred, axis=-1), tf.int32)
+        if len(y_true.shape) == 2 and y_true.shape[-1] > 1:
+            y_true_cls = tf.cast(tf.argmax(y_true, axis=-1), tf.int32)
+        else:
+            y_true_cls = tf.cast(tf.squeeze(y_true), tf.int32)
+        correct = tf.cast(tf.equal(y_pred_cls, y_true_cls), tf.float32)
+        if sample_weight is not None:
+            sw = tf.cast(tf.squeeze(sample_weight), tf.float32)
+            self.correct.assign_add(tf.reduce_sum(correct * sw))
+            self.total.assign_add(tf.reduce_sum(sw))
+        else:
+            self.correct.assign_add(tf.reduce_sum(correct))
+            self.total.assign_add(tf.cast(tf.shape(correct)[0], tf.float32))
+
+    def result(self):
+        return tf.math.divide_no_nan(self.correct, self.total)
+
+    def reset_state(self):
+        self.total.assign(0.0); self.correct.assign(0.0)
+
+    def get_config(self):
+        return super().get_config()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOSS
+# ══════════════════════════════════════════════════════════════════════════════
+@tf.keras.utils.register_keras_serializable()
+class SoftFocalLoss(tf.keras.losses.Loss):
+    def __init__(self, gamma=2.0, **kwargs):
+        super().__init__(**kwargs); self.gamma = gamma
+
+    def call(self, y_true, y_pred):
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+        n_cls  = tf.shape(y_pred)[-1]
+        if len(y_true.shape) == 1 or (len(y_true.shape) == 2 and y_true.shape[-1] == 1):
+            y_true = tf.one_hot(tf.cast(tf.squeeze(y_true), tf.int32), n_cls)
+        y_true = tf.cast(y_true, tf.float32)
+        ce     = -tf.reduce_sum(y_true * tf.math.log(y_pred), axis=-1)
+        p_t    = tf.reduce_sum(y_true * y_pred, axis=-1)
+        return tf.reduce_mean(tf.pow(1.0 - p_t, self.gamma) * ce)
+
+    def get_config(self):
+        cfg = super().get_config(); cfg.update({"gamma": self.gamma}); return cfg
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HOC FEATURES
+# ══════════════════════════════════════════════════════════════════════════════
+def compute_hoc(iq_frame):
+    """10 HOC features from (1024, 2) frame. 1024 samples → ~8x better C42 vs 128."""
+    I = iq_frame[:, 0].astype(np.complex64)
+    Q = iq_frame[:, 1].astype(np.complex64)
+    z = I + 1j * Q
+
+    m10 = np.mean(z);         m20 = np.mean(z**2);       m21 = np.mean(np.abs(z)**2)
+    m40 = np.mean(z**4);      m41 = np.mean(np.abs(z)**2 * z**2)
+    m42 = np.mean(np.abs(z)**4)
+    m60 = np.mean(z**6);      m61 = np.mean(np.abs(z)**2 * z**4)
+    m62 = np.mean(np.abs(z)**4 * z**2); m63 = np.mean(np.abs(z)**6)
+
+    C20 = m20 - m10**2;       C21 = m21 - np.abs(m10)**2
+    C40 = m40 - 3*m20**2;     C41 = m41 - 3*m20*m21
+    C42 = m42 - np.abs(m20)**2 - 2*m21**2
+    C60 = m60 - 15*m20*m40 + 30*m20**3
+    C61 = m61 - 5*m21*m40 - 10*m20*m41 + 30*m20**2*m21
+    C62 = m62 - 6*m21*m41 - np.abs(m20)**2*m40 + \
+               6*m21**2*m20 + 4*m20*np.conj(m20)*m21 - 4*m21**3
+    C63 = m63 - 9*m42*m21 + 12*m21**3
+
+    features = np.array([
+        C20.real, C21.real, C40.real, C41.real, C42.real,
+        C60.real, C61.real, C62.real, C63.real, np.abs(C42),
+    ], dtype=np.float32)
+    features = np.clip(features, -100.0, 100.0)
+    return features / (np.sqrt(np.sum(features**2)) + 1e-8)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PREPROCESSING
+# ══════════════════════════════════════════════════════════════════════════════
+def preprocess_frame(raw_frame):
+    """raw_frame: (1024, 2) — 2018 dataset is already (T,2) format."""
+    I   = raw_frame[:, 0].astype(np.float32)
+    Q   = raw_frame[:, 1].astype(np.float32)
+    rms = np.sqrt(np.mean(I**2 + Q**2))
+    if rms > 1e-8:
+        I, Q = I / rms, Q / rms
+    iq  = np.stack([I, Q], axis=-1)
+    ap  = np.stack([np.sqrt(I**2 + Q**2), np.arctan2(Q, I)], axis=-1)
+    hoc = compute_hoc(iq)
+    return iq, ap, hoc
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUGMENTATION
+# ══════════════════════════════════════════════════════════════════════════════
+def augment_iq_ap(iq, ap):
+    theta  = tf.random.uniform(shape=(tf.shape(iq)[0],), minval=0.0, maxval=2*np.pi)
+    cos_t  = tf.cos(theta)[:, None, None]
+    sin_t  = tf.sin(theta)[:, None, None]
+    scale  = tf.random.uniform(shape=(tf.shape(iq)[0], 1, 1), minval=0.9, maxval=1.1)
+    I_rot  = (cos_t * iq[..., 0:1] - sin_t * iq[..., 1:2]) * scale
+    Q_rot  = (sin_t * iq[..., 0:1] + cos_t * iq[..., 1:2]) * scale
+    iq_aug = tf.concat([I_rot, Q_rot], axis=-1)
+    ap_aug = tf.concat([
+        tf.sqrt(tf.reduce_sum(iq_aug**2, axis=-1, keepdims=True)),
+        tf.atan2(iq_aug[..., 1:2], iq_aug[..., 0:1])
+    ], axis=-1)
+    return iq_aug, ap_aug
+
+
+def apply_soft_mixup(iq, ap, hoc, y_oh, snr):
+    batch_size = tf.shape(iq)[0]
+    lam   = tf.random.uniform(shape=(batch_size,), minval=0.5, maxval=1.0)
+    perm  = tf.random.shuffle(tf.range(batch_size))
+    iq2   = tf.gather(iq, perm);   ap2  = tf.gather(ap, perm)
+    hoc2  = tf.gather(hoc, perm);  y2   = tf.gather(y_oh, perm)
+    snr2  = tf.gather(snr, perm)
+    apply = tf.cast(tf.random.uniform(shape=(batch_size,)) < 0.30, tf.float32)
+    lam_e = lam * apply + (1.0 - apply)
+    lam_x = lam_e[:, None, None];  lam_f = lam_e[:, None]
+    iq_m  = lam_x*iq  + (1.0-lam_x)*iq2
+    ap_m  = lam_x*ap  + (1.0-lam_x)*ap2
+    hoc_m = lam_f*hoc + (1.0-lam_f)*hoc2
+    y_m   = lam_f*tf.cast(y_oh,tf.float32) + (1.0-lam_f)*tf.cast(y2,tf.float32)
+    snr_m = lam_e*tf.cast(snr,tf.float32)  + (1.0-lam_e)*tf.cast(snr2,tf.float32)
+    return iq_m, ap_m, hoc_m, y_m, snr_m
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ARCHITECTURE COMPONENTS
+# ══════════════════════════════════════════════════════════════════════════════
+@tf.keras.utils.register_keras_serializable()
+class ComplexConv1D(layers.Layer):
+    def __init__(self, filters, kernel_size, padding='same',
+                 strides=1, use_bias=False, **kwargs):
+        super().__init__(**kwargs)
+        self.filters=filters; self.kernel_size=kernel_size
+        self.padding=padding; self.strides=strides; self.use_bias=use_bias
+
+    def build(self, s):
+        self.conv_r=layers.Conv1D(self.filters,self.kernel_size,padding=self.padding,
+                                   strides=self.strides,use_bias=self.use_bias)
+        self.conv_i=layers.Conv1D(self.filters,self.kernel_size,padding=self.padding,
+                                   strides=self.strides,use_bias=self.use_bias)
+        super().build(s)
+
+    def call(self, x):
+        mid=tf.shape(x)[-1]//2; xr,xi=x[...,:mid],x[...,mid:]
+        return tf.concat([self.conv_r(xr)-self.conv_i(xi),
+                          self.conv_r(xi)+self.conv_i(xr)],axis=-1)
+
+    def get_config(self):
+        cfg=super().get_config()
+        cfg.update({"filters":self.filters,"kernel_size":self.kernel_size,
+                    "padding":self.padding,"strides":self.strides,"use_bias":self.use_bias})
+        return cfg
+
+
+@tf.keras.utils.register_keras_serializable()
+class ComplexBatchNorm(layers.Layer):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bn_r=layers.BatchNormalization(); self.bn_i=layers.BatchNormalization()
+
+    def call(self, x, training=None):
+        mid=tf.shape(x)[-1]//2
+        return tf.concat([self.bn_r(x[...,:mid],training=training),
+                          self.bn_i(x[...,mid:],training=training)],axis=-1)
+
+    def get_config(self): return super().get_config()
+
+
+def complex_res_block(x, filters, ks=7):
+    sc=x
+    out=layers.Activation('gelu')(ComplexBatchNorm()(ComplexConv1D(filters,ks)(x)))
+    out=ComplexBatchNorm()(ComplexConv1D(filters,ks)(out))
+    if x.shape[-1]!=filters*2: sc=ComplexBatchNorm()(ComplexConv1D(filters,1)(x))
+    return layers.Activation('gelu')(layers.Add()([out,sc]))
+
+
+def real_res_block(x, filters, ks=7):
+    sc=x
+    out=layers.Activation('gelu')(layers.BatchNormalization()(
+        layers.Conv1D(filters,ks,padding='same',use_bias=False)(x)))
+    out=layers.BatchNormalization()(
+        layers.Conv1D(filters,ks,padding='same',use_bias=False)(out))
+    if x.shape[-1]!=filters:
+        sc=layers.BatchNormalization()(
+           layers.Conv1D(filters,1,padding='same',use_bias=False)(x))
+    return layers.Activation('gelu')(layers.Add()([out,sc]))
+
+
+@tf.keras.utils.register_keras_serializable()
+class CrossStreamAttention(layers.Layer):
+    """
+    Cross-attention between IQ and AP streams.
+    Must operate on compressed (128-step) sequences — NOT 1024-step.
+    1024-step attention = [B,4,1024,1024] = OOM. 128-step = [B,4,128,128] = fine.
+    """
+    def __init__(self, num_heads=4, key_dim=16, dropout=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.num_heads=num_heads; self.key_dim=key_dim; self.dropout_r=dropout
+
+    def build(self, s):
+        self.a_iq=layers.MultiHeadAttention(num_heads=self.num_heads,
+                                             key_dim=self.key_dim,dropout=self.dropout_r)
+        self.n_iq=layers.LayerNormalization(epsilon=1e-6)
+        self.a_ap=layers.MultiHeadAttention(num_heads=self.num_heads,
+                                             key_dim=self.key_dim,dropout=self.dropout_r)
+        self.n_ap=layers.LayerNormalization(epsilon=1e-6)
+        super().build(s)
+
+    def call(self, inputs, training=None):
+        iq,ap=inputs
+        return (iq + self.a_iq(self.n_iq(iq),ap,ap,training=training),
+                ap + self.a_ap(self.n_ap(ap),iq,iq,training=training))
+
+    def get_config(self):
+        cfg=super().get_config()
+        cfg.update({"num_heads":self.num_heads,"key_dim":self.key_dim,
+                    "dropout":self.dropout_r})
+        return cfg
+
+
+def build_snr_estimator(iq_input):
+    """Lightweight SNR estimator. Operates on full 1024-step input but only uses GAP."""
+    x=layers.Activation('relu')(layers.BatchNormalization()(
+      layers.Conv1D(16,7,padding='same',use_bias=False)(iq_input)))
+    x=layers.Activation('relu')(layers.BatchNormalization()(
+      layers.Conv1D(16,5,padding='same',use_bias=False)(x)))
+    x=layers.GlobalAveragePooling1D()(x)   # collapses 1024 → scalar per channel
+    x=layers.Dense(32,activation='relu')(x)
+    return layers.Dense(1,activation='sigmoid',name='snr_pred')(x)
+
+
+@tf.keras.utils.register_keras_serializable()
+class SNRAdaptiveGate(layers.Layer):
+    def __init__(self, out_dim, **kwargs):
+        super().__init__(**kwargs); self.out_dim=out_dim
+        self.proj_iq=layers.Dense(out_dim,use_bias=False)
+        self.proj_ap=layers.Dense(out_dim,use_bias=False)
+        self.ln=layers.LayerNormalization(epsilon=1e-6)
+
+    def call(self, inputs):
+        iq,ap,alpha=inputs; at=alpha[:,None,:]
+        return self.ln((1.0-at)*self.proj_iq(iq)+at*self.proj_ap(ap))
+
+    def get_config(self):
+        cfg=super().get_config(); cfg.update({"out_dim":self.out_dim}); return cfg
+
+
+def channel_attention(x, reduction=4):
+    ch=x.shape[-1]; gap=layers.GlobalAveragePooling1D()(x)
+    attn=layers.Dense(ch//reduction,activation='relu')(gap)
+    attn=layers.Dense(ch,activation='sigmoid')(attn)
+    return x*attn[:,None,:]
+
+
+@tf.keras.utils.register_keras_serializable()
+class LearnedPositionEmbedding(layers.Layer):
+    def __init__(self, max_len=128, **kwargs):
+        super().__init__(**kwargs); self.max_len=max_len
+
+    def build(self, s):
+        self.pe=self.add_weight(name='pe',shape=(1,self.max_len,s[-1]),
+                                 initializer='zeros',trainable=True)
+
+    def call(self, x): return x+self.pe[:,:tf.shape(x)[1],:]
+
+    def get_config(self):
+        cfg=super().get_config(); cfg.update({"max_len":self.max_len}); return cfg
+
+
+@tf.keras.utils.register_keras_serializable()
+class WarmupCosineDecay(keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, warmup_steps, total_steps, peak_lr=3e-4, min_lr=1e-6, **kwargs):
+        super().__init__(**kwargs)
+        self.warmup_steps=float(warmup_steps); self.total_steps=float(total_steps)
+        self.peak_lr=float(peak_lr); self.min_lr=float(min_lr)
+
+    def __call__(self, step):
+        step=tf.cast(step,tf.float32)
+        warmup=self.peak_lr*step/self.warmup_steps
+        progress=(step-self.warmup_steps)/(self.total_steps-self.warmup_steps)
+        cosine=self.min_lr+(self.peak_lr-self.min_lr)*0.5*(
+               1.0+tf.cos(np.pi*tf.minimum(progress,1.0)))
+        return tf.where(step<self.warmup_steps,warmup,cosine)
+
+    def get_config(self):
+        return {"warmup_steps":self.warmup_steps,"total_steps":self.total_steps,
+                "peak_lr":self.peak_lr,"min_lr":self.min_lr}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+def build_model_v7_2018(n_classes=24, hoc_dim=10, seq_len=1024):
+    """
+    CORRECTED flow — compress BEFORE cross-attention:
+
+    (B, 1024, 2)
+    → ResBlocks [IQ complex, AP real] × 3     (B, 1024, C)
+    → StridedConv stride=8                    (B,  128, C)   ← HERE
+    → CrossStreamAttention × 3               (B,  128, C)   ← safe
+    → SNRAdaptiveGate                         (B,  128, 160)
+    → BiLSTM(128)                             (B,  128, 256)
+    → ChannelAttn + GAP                       (B,  256)
+    → HOC MLP                                 (B,   64)
+    → Concat → Dense → softmax                (B,   24)
+    """
+    iq_input  = keras.Input(shape=(seq_len, 2),  name='iq_input')
+    ap_input  = keras.Input(shape=(seq_len, 2),  name='ap_input')
+    hoc_input = keras.Input(shape=(hoc_dim,),     name='hoc_input')
+
+    # ── IQ stream ResBlocks (on full 1024) ────────────────────────────────────
+    iq = layers.Dropout(0.05)(layers.Activation('gelu')(
+         ComplexBatchNorm(name='iq_stem_bn')(
+         ComplexConv1D(32,7,name='iq_stem')(iq_input))))
+    iq = complex_res_block(iq, 32, 7)
+    iq = complex_res_block(iq, 48, 5)
+    iq = complex_res_block(iq, 48, 5)
+    iq = layers.Dropout(0.1)(iq)              # (B, 1024, 96)
+
+    # ── AP stream ResBlocks (on full 1024) ────────────────────────────────────
+    ap = layers.Dropout(0.05)(layers.Activation('gelu')(
+         layers.BatchNormalization()(
+         layers.Conv1D(32,7,padding='same',use_bias=False,name='ap_stem')(ap_input))))
+    ap = real_res_block(ap, 32, 7)
+    ap = real_res_block(ap, 48, 5)
+    ap = real_res_block(ap, 64, 5)
+    ap = layers.Dropout(0.1)(ap)              # (B, 1024, 64)
+
+    # ── Compress 1024 → 128 BEFORE cross-attention ───────────────────────────
+    # stride=8: 1024/8 = 128. This is the OOM fix.
+    # CrossAttn on 128 steps: [B,4,128,128] = 262K floats — fine.
+    # CrossAttn on 1024 steps: [B,4,1024,1024] = 16M floats — OOM.
+    iq = layers.Activation('gelu')(layers.BatchNormalization()(
+         layers.Conv1D(96, 8, strides=8, padding='same',
+                       use_bias=False, name='iq_compress')(iq)))   # (B, 128, 96)
+    ap = layers.Activation('gelu')(layers.BatchNormalization()(
+         layers.Conv1D(64, 8, strides=8, padding='same',
+                       use_bias=False, name='ap_compress')(ap)))   # (B, 128, 64)
+
+    # ── CrossStreamAttention × 3 (on 128 steps — safe) ───────────────────────
+    iq, ap = CrossStreamAttention(4, 16, name='ca1')([iq, ap])
+    iq, ap = CrossStreamAttention(4, 24, name='ca2')([iq, ap])
+    iq, ap = CrossStreamAttention(4, 24, name='ca3')([iq, ap])
+
+    # ── SNR-adaptive gate ─────────────────────────────────────────────────────
+    snr_pred = build_snr_estimator(iq_input)   # reads from original 1024-step input
+    fused = SNRAdaptiveGate(out_dim=160, name='snr_gate')([iq, ap, snr_pred])
+
+    # ── Temporal modelling ────────────────────────────────────────────────────
+    fused = LearnedPositionEmbedding(max_len=128, name='pos_emb')(fused)
+    fused = layers.Bidirectional(
+        layers.LSTM(128, return_sequences=True, dropout=0.1),
+        name='bilstm')(fused)
+    fused = channel_attention(fused, reduction=4)
+    fused = layers.GlobalAveragePooling1D()(fused)
+    fused = layers.LayerNormalization(epsilon=1e-6)(fused)
+
+    # ── HOC branch ────────────────────────────────────────────────────────────
+    hoc = layers.Dropout(0.2)(layers.BatchNormalization()(
+          layers.Dense(32, activation='gelu')(hoc_input)))
+    hoc = layers.Dropout(0.2)(layers.BatchNormalization()(
+          layers.Dense(64, activation='gelu')(hoc)))
+
+    # ── Classifier ────────────────────────────────────────────────────────────
+    combined = layers.Concatenate(name='deep_hoc_fusion')([fused, hoc])
+    combined = layers.Dropout(0.3)(
+               layers.Dense(128, activation='gelu',
+                            kernel_regularizer=keras.regularizers.l2(5e-5))(combined))
+    cls_out = layers.Dense(n_classes, activation='softmax',
+                            dtype='float32', name='output')(combined)
+
+    return keras.Model([iq_input, ap_input, hoc_input], [cls_out, snr_pred],
+                       name='RadioML_v7_2018')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [1/8]  LOAD
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[1/8] Loading RML2018.01a ...")
+with h5py.File(DATASET_PATH, 'r') as f:
+    print(f"   X shape: {f['X'].shape}  Y shape: {f['Y'].shape}  Z shape: {f['Z'].shape}")
+print(f"   Classes ({N_CLASSES}): {MODULATIONS_2018}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [2/8]  BUILD DATASET
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[2/8] Building dataset ...")
+SAMPLES_PER_PAIR = 200
+SNR_TRAIN_MIN    = -10
+
+IQ_list, AP_list, HOC_list = [], [], []
+y_list, snr_list, w_snr_list = [], [], []
+
+with h5py.File(DATASET_PATH, 'r') as f:
+    X_dset = f['X']
+    for mod_idx in range(N_CLASSES):
+        for snr_idx, snr in enumerate(SNR_LEVELS):
+            if snr < SNR_TRAIN_MIN:
+                continue
+            snr_weight = 0.25 if snr < -6 else 1.0
+            n_this     = max(50, SAMPLES_PER_PAIR // 4) if snr < -6 else SAMPLES_PER_PAIR
+            block_start = mod_idx * 26 * 4096 + snr_idx * 4096
+            idxs        = np.random.choice(4096, min(n_this, 4096), replace=False)
+            frames      = X_dset[sorted(block_start + idxs)]
+            for frame in frames:
+                iq_f, ap_f, hoc_f = preprocess_frame(frame)
+                IQ_list.append(iq_f); AP_list.append(ap_f); HOC_list.append(hoc_f)
+                y_list.append(mod_idx); snr_list.append(snr); w_snr_list.append(snr_weight)
+        if (mod_idx + 1) % 6 == 0:
+            print(f"   {mod_idx+1}/{N_CLASSES} classes — {len(IQ_list):,} samples")
+
+IQ       = np.array(IQ_list,    dtype=np.float32)
+AP       = np.array(AP_list,    dtype=np.float32)
+HOC      = np.array(HOC_list,   dtype=np.float32)
+y        = np.array(y_list,     dtype=np.int32)
+snr_lbl  = np.array(snr_list,   dtype=np.float32)
+w_snr    = np.array(w_snr_list, dtype=np.float32)
+snr_norm = (snr_lbl - SNR_MIN_2018) / (SNR_MAX_2018 - SNR_MIN_2018)
+
+HOC_DIM = HOC.shape[1]
+counts  = Counter(y.tolist())
+print(f"   Total: {len(IQ):,}  IQ={IQ.shape}  AP={AP.shape}  HOC={HOC.shape}")
+print(f"   Balance: min={min(counts.values())}  max={max(counts.values())}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [3/8]  SPLIT
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[3/8] Splitting 70 / 15 / 15 ...")
+(IQ_tv,IQ_test,AP_tv,AP_test,HOC_tv,HOC_test,
+ y_tv,y_test,snr_tv,snr_test,snrn_tv,snrn_test,
+ wsn_tv,wsn_test) = train_test_split(
+    IQ,AP,HOC,y,snr_lbl,snr_norm,w_snr,
+    test_size=0.15,random_state=42,stratify=y)
+
+(IQ_train,IQ_val,AP_train,AP_val,HOC_train,HOC_val,
+ y_train,y_val,snr_train,snr_val,snrn_train,snrn_val,
+ wsn_train,wsn_val) = train_test_split(
+    IQ_tv,AP_tv,HOC_tv,y_tv,snr_tv,snrn_tv,wsn_tv,
+    test_size=0.176,random_state=42,stratify=y_tv)
+
+print(f"   Train: {len(IQ_train):,}  Val: {len(IQ_val):,}  Test: {len(IQ_test):,}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [4/8]  BUILD MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[4/8] Building model ...")
+with strategy.scope():
+    model = build_model_v7_2018(n_classes=N_CLASSES, hoc_dim=HOC_DIM, seq_len=SEQ_LEN)
+
+model.summary()
+n_params = model.count_params()
+print(f"\n   Parameters : {n_params:,}")
+print(f"   ✓ Compress 1024→128 BEFORE CrossAttn — OOM fixed")
+print(f"   Attention matrix size: [B,4,128,128] vs [B,4,1024,1024] previously")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [5/8]  COMPILE
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[5/8] Compiling ...")
+cw_base = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+cw_dict = dict(enumerate(cw_base))
+
+sample_weights_train = np.array(
+    [cw_dict[yi]*wi for yi,wi in zip(y_train,wsn_train)], dtype=np.float32)
+
+BATCH_SIZE      = 128
+EPOCHS_TOTAL    = 150
+WARMUP_EPOCHS   = 8
+STEPS_PER_EPOCH = len(IQ_train) // BATCH_SIZE
+total_steps     = EPOCHS_TOTAL  * STEPS_PER_EPOCH
+warmup_steps    = WARMUP_EPOCHS * STEPS_PER_EPOCH
+
+with strategy.scope():
+    model.compile(
+        optimizer=keras.optimizers.AdamW(
+            learning_rate=WarmupCosineDecay(
+                warmup_steps=warmup_steps, total_steps=total_steps,
+                peak_lr=3e-4, min_lr=1e-6),
+            weight_decay=1e-5, clipnorm=1.0),
+        loss={'output': SoftFocalLoss(gamma=2.0), 'snr_pred': 'mse'},
+        loss_weights={'output': 1.0, 'snr_pred': 0.1},
+        metrics={'output': [SoftArgmaxAccuracy(name='accuracy')],
+                 'snr_pred': ['mae']}
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [6/8]  TRAIN
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[6/8] Training ...")
+print(f"   24 classes  |  1024 samples  |  compress→128 before CrossAttn")
+print(f"   Parameters: {n_params:,}  |  Batch: {BATCH_SIZE}  |  Patience: 30")
+print(f"   SOTA: MoE-AMC 71.76% all-SNR  |  Target: >70% all-SNR, >93% high-SNR")
+
+def make_train_ds(IQ, AP, HOC, y, snr_n, sw, bs, n_cls):
+    y_oh = tf.keras.utils.to_categorical(y, num_classes=n_cls).astype(np.float32)
+    ds   = tf.data.Dataset.from_tensor_slices((IQ, AP, HOC, y_oh, snr_n, sw))
+    ds   = ds.shuffle(len(IQ), reshuffle_each_iteration=True).batch(bs, drop_remainder=True)
+
+    def process(iq, ap, hoc, y_oh, snr_n, w):
+        iq_a, ap_a = augment_iq_ap(iq, ap)
+        iq_m, ap_m, hoc_m, y_m, sn_m = apply_soft_mixup(iq_a, ap_a, hoc, y_oh, snr_n)
+        return (iq_m, ap_m, hoc_m), {'output': y_m, 'snr_pred': sn_m[:, None]}, w
+
+    return ds.map(process, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+
+
+def make_val_ds(IQ, AP, HOC, y, snr_n, bs):
+    return (tf.data.Dataset
+            .from_tensor_slices(((IQ, AP, HOC), {'output': y, 'snr_pred': snr_n[:, None]}))
+            .batch(bs).prefetch(tf.data.AUTOTUNE))
+
+
+train_ds = make_train_ds(IQ_train, AP_train, HOC_train, y_train,
+                          snrn_train, sample_weights_train, BATCH_SIZE, N_CLASSES)
+val_ds   = make_val_ds(IQ_val, AP_val, HOC_val, y_val, snrn_val, BATCH_SIZE)
+
+callbacks = [
+    keras.callbacks.EarlyStopping(
+        monitor='val_output_accuracy', patience=30, mode='max',
+        restore_best_weights=True, verbose=1),
+    keras.callbacks.ModelCheckpoint(
+        filepath=MODEL_PATH, monitor='val_output_accuracy', mode='max',
+        save_best_only=True, verbose=1),
+    keras.callbacks.TerminateOnNaN(),
+]
+
+history = model.fit(
+    train_ds, validation_data=val_ds,
+    epochs=EPOCHS_TOTAL, callbacks=callbacks, verbose=1)
+
+training_time = (time.time() - start_time) / 60
+print(f"\n   Training done in {training_time:.1f} minutes")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [7/8]  EVALUATE
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[7/8] Evaluating ...")
+model = keras.models.load_model(
+    MODEL_PATH,
+    custom_objects={
+        'SoftFocalLoss': SoftFocalLoss,
+        'SoftArgmaxAccuracy': SoftArgmaxAccuracy,
+        'LearnedPositionEmbedding': LearnedPositionEmbedding,
+        'WarmupCosineDecay': WarmupCosineDecay,
+        'ComplexConv1D': ComplexConv1D,
+        'ComplexBatchNorm': ComplexBatchNorm,
+        'CrossStreamAttention': CrossStreamAttention,
+        'SNRAdaptiveGate': SNRAdaptiveGate,
+    }, compile=False)
+
+print("   Building evaluation set (50 per class per SNR) ...")
+IQ_full, AP_full, HOC_full, y_full, snr_full = [], [], [], [], []
+
+with h5py.File(DATASET_PATH, 'r') as f:
+    X_dset = f['X']
+    for mod_idx in range(N_CLASSES):
+        for snr_idx, snr in enumerate(SNR_LEVELS):
+            block_start = mod_idx * 26 * 4096 + snr_idx * 4096
+            idxs        = np.random.choice(4096, 50, replace=False)
+            frames      = X_dset[sorted(block_start + idxs)]
+            for frame in frames:
+                iq_f, ap_f, hoc_f = preprocess_frame(frame)
+                IQ_full.append(iq_f); AP_full.append(ap_f); HOC_full.append(hoc_f)
+                y_full.append(mod_idx); snr_full.append(snr)
+
+IQ_full  = np.array(IQ_full,  dtype=np.float32)
+AP_full  = np.array(AP_full,  dtype=np.float32)
+HOC_full = np.array(HOC_full, dtype=np.float32)
+y_full   = np.array(y_full,   dtype=np.int32)
+snr_full = np.array(snr_full, dtype=np.int32)
+
+preds      = model.predict((IQ_full, AP_full, HOC_full), verbose=0, batch_size=256)
+y_pred     = np.argmax(preds[0], axis=1)
+alpha_vals = preds[1].squeeze()
+
+high_mask    = snr_full >= 0
+high_snr_acc = accuracy_score(y_full[high_mask], y_pred[high_mask])
+full_acc     = accuracy_score(y_full, y_pred)
+
+snr_accs = {}
+print("\nSNR-STRATIFIED ACCURACY")
+for snr in sorted(set(snr_full)):
+    mask = snr_full == snr
+    if mask.sum() < 5: continue
+    acc = accuracy_score(y_full[mask], y_pred[mask])
+    snr_accs[snr] = acc
+    print(f"  SNR {snr:+4d} dB : {acc:.1%}  {'█' * int(acc * 30)}")
+
+print("\nPER-CLASS ACCURACY at HIGH SNR (≥0 dB)")
+print(f"  {'Class':<12} {'Acc':>8}  {'F1':>8}")
+print("  " + "-" * 32)
+f1s = f1_score(y_full[high_mask], y_pred[high_mask], average=None, zero_division=0)
+for mod_idx, mod in enumerate(MODULATIONS_2018):
+    mask = high_mask & (y_full == mod_idx)
+    if mask.sum() < 5: continue
+    acc = accuracy_score(y_full[mask], y_pred[mask])
+    print(f"  {mod:<12} {acc:>7.1%}  {f1s[mod_idx] if mod_idx < len(f1s) else 0:>7.3f}")
+
+print(f"\n{'='*70}")
+print(f"Overall (all SNRs)   : {full_acc:.2%}  (SOTA: MoE-AMC 71.76%)")
+print(f"High-SNR (≥0 dB)     : {high_snr_acc:.2%}  (SOTA: ~94%)")
+if   full_acc     >= 0.70: print("STATUS: SOTA tier on all-SNR average")
+elif full_acc     >= 0.65: print("STATUS: EXCELLENT — competitive")
+elif high_snr_acc >= 0.90: print("STATUS: STRONG high-SNR result")
+else:                       print("STATUS: SOLID BASELINE on 2018")
+print(f"{'='*70}")
+
+print("\nFULL CLASSIFICATION REPORT (high-SNR ≥0 dB)")
+print(classification_report(y_full[high_mask], y_pred[high_mask],
+                             target_names=MODULATIONS_2018, digits=3))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [8/8]  VISUALISATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[8/8] Saving visualisations ...")
+
+# Training curves
+fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+axes[0].plot(history.history['loss'],     'b-', lw=2, label='Train')
+axes[0].plot(history.history['val_loss'], 'r-', lw=2, label='Val')
+axes[0].set(title='Total loss (2018)', xlabel='Epoch')
+axes[0].legend(); axes[0].grid(alpha=0.3)
+axes[1].plot(history.history['output_accuracy'],     'b-', lw=2, label='Train')
+axes[1].plot(history.history['val_output_accuracy'], 'r-', lw=2, label='Val')
+axes[1].axhline(0.70, color='g', ls='--', alpha=0.8, label='MoE-AMC 71.76%')
+axes[1].set(title='Classification accuracy (2018)', xlabel='Epoch')
+axes[1].legend(); axes[1].grid(alpha=0.3)
+axes[2].plot(history.history['snr_pred_mae'],     'b-', lw=2, label='Train')
+axes[2].plot(history.history['val_snr_pred_mae'], 'r-', lw=2, label='Val')
+axes[2].set(title='SNR estimator MAE', xlabel='Epoch')
+axes[2].legend(); axes[2].grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig(f'{RESULTS_DIR}/training_curves_v7_2018.png', dpi=150, bbox_inches='tight')
+plt.close(); print("   ✓ training_curves_v7_2018.png")
+
+# Confusion matrix
+cm      = confusion_matrix(y_full[high_mask], y_pred[high_mask])
+cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+plt.figure(figsize=(22, 20))
+sns.heatmap(cm_norm, annot=True, fmt='.2f', cmap='Blues',
+            xticklabels=MODULATIONS_2018, yticklabels=MODULATIONS_2018,
+            annot_kws={'size': 7})
+plt.title(f'Confusion matrix v7-2018  (≥0 dB  |  {high_snr_acc*100:.1f}%)',
+          fontweight='bold')
+plt.ylabel('True'); plt.xlabel('Predicted')
+plt.xticks(rotation=45, ha='right', fontsize=8); plt.yticks(fontsize=8)
+plt.tight_layout()
+plt.savefig(f'{RESULTS_DIR}/confusion_matrix_v7_2018.png', dpi=150, bbox_inches='tight')
+plt.close(); print("   ✓ confusion_matrix_v7_2018.png")
+
+# SNR accuracy curve
+snrs_s = sorted(snr_accs.keys())
+plt.figure(figsize=(14, 5))
+plt.plot(snrs_s, [snr_accs[s] for s in snrs_s], 'b-o', lw=2.5, ms=6,
+         label=f'v7-2018  {high_snr_acc*100:.1f}% high-SNR  {full_acc*100:.1f}% all-SNR')
+plt.axhline(0.7176, color='g', ls='--', alpha=0.7, label='MoE-AMC 71.76% all-SNR')
+plt.axhline(0.9439, color='r', ls=':',  alpha=0.7, label='Multiscale+HOC 94.39% high-SNR')
+plt.axvline(0, color='gray', ls=':', alpha=0.5)
+plt.xlabel('SNR (dB)', fontweight='bold'); plt.ylabel('Accuracy', fontweight='bold')
+plt.title('v7 AMC accuracy vs SNR — RML2018.01a', fontweight='bold')
+plt.legend(loc='upper left'); plt.grid(alpha=0.3); plt.tight_layout()
+plt.savefig(f'{RESULTS_DIR}/snr_accuracy_v7_2018.png', dpi=150, bbox_inches='tight')
+plt.close(); print("   ✓ snr_accuracy_v7_2018.png")
+
+# SNR gate analysis
+fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+snrs_sorted = sorted(set(snr_full))
+axes[0].plot(snrs_sorted,
+             [alpha_vals[snr_full == s].mean() for s in snrs_sorted],
+             'b-o', lw=2.5, ms=6)
+axes[0].axvline(0, color='gray', ls=':', alpha=0.5)
+axes[0].set(title='Mean SNR gate (α) vs SNR — RML2018.01a',
+            xlabel='SNR (dB)', ylabel='α')
+axes[0].grid(alpha=0.3); axes[0].set_ylim(0, 1)
+
+cmap = plt.cm.get_cmap('tab20', N_CLASSES)
+for mod_idx, mod in enumerate(MODULATIONS_2018):
+    vals = [alpha_vals[(snr_full==s)&(y_full==mod_idx)].mean()
+            if ((snr_full==s)&(y_full==mod_idx)).sum() > 0 else np.nan
+            for s in snrs_sorted]
+    axes[1].plot(snrs_sorted, vals, '-', lw=1.2,
+                 color=cmap(mod_idx), label=mod, alpha=0.8)
+axes[1].axvline(0, color='gray', ls=':', alpha=0.5)
+axes[1].set(title='SNR gate (α) per modulation — RML2018.01a',
+            xlabel='SNR (dB)', ylabel='α')
+axes[1].legend(bbox_to_anchor=(1.02,1), loc='upper left', fontsize=7)
+axes[1].grid(alpha=0.3); axes[1].set_ylim(0, 1)
+plt.tight_layout()
+plt.savefig(f'{RESULTS_DIR}/snr_gate_analysis_v7_2018.png', dpi=150, bbox_inches='tight')
+plt.close(); print("   ✓ snr_gate_analysis_v7_2018.png")
+
+# Save metadata
+total_time = (time.time() - start_time) / 60
+with open(f'{RESULTS_DIR}/model_metadata_v7_2018.json', 'w') as f:
+    json.dump({
+        'version': 'v7-2018', 'dataset': 'RML2018.01a',
+        'n_classes': N_CLASSES, 'seq_len': SEQ_LEN,
+        'parameters': int(n_params),
+        'high_snr_acc': round(float(high_snr_acc), 4),
+        'overall_acc': round(float(full_acc), 4),
+        'snr_accuracy': {str(k): round(float(v),4) for k,v in snr_accs.items()},
+        'training_time_min': round(float(total_time), 1),
+        'oom_fix': 'Compress 1024→128 BEFORE CrossStreamAttention',
+        'attention_matrix_size': '[B,4,128,128] vs [B,4,1024,1024] previously',
+        'created_date': time.strftime('%Y-%m-%d %H:%M:%S'),
+    }, f, indent=2)
+print("   ✓ model_metadata_v7_2018.json")
+
+print("\n" + "=" * 80)
+print("v7-2018 COMPLETE")
+print("=" * 80)
+print(f"  High-SNR (≥0 dB) : {high_snr_acc:.2%}")
+print(f"  Overall (all SNR): {full_acc:.2%}  (MoE-AMC SOTA: 71.76%)")
+print(f"  Parameters       : {n_params:,}")
+print(f"  Training time    : {training_time:.1f} min")
+print(f"  Results          : {RESULTS_DIR}/")
+print("=" * 80)
